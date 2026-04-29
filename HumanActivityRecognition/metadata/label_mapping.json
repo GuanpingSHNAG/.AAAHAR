@@ -1,0 +1,17 @@
+{
+    "label_to_idx": {
+        "jumping": 0,
+        "running": 1,
+        "seated-breathing": 2,
+        "walking": 3,
+        "wavinghand": 4
+    },
+    "idx_to_label": {
+        "0": "jumping",
+        "1": "running",
+        "2": "seated-breathing",
+        "3": "walking",
+        "4": "wavinghand"
+    },
+    "num_classes": 5
+}
