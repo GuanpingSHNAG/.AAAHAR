@@ -114,3 +114,42 @@ $$C_{semantic} = \mathbb{E}_{\hat{X} \sim p(X|H_0)} \left[ \int_0^{\Gamma_{mask}
    $$\text{diag}(C_{semantic}) \approx \sum_{t} \mathbb{E}_{\mathbf{v}} \left[ \mathbf{v} \odot \nabla_{X} (\mathbf{v}^T \tilde{\epsilon}_\theta) \right] \Delta \gamma_t$$
    PyTorch/JAX 中的反向自动微分引擎可以极速完成 VJP 运算，将计算复杂度从 $O(K^2)$ 降维至 $O(K)$，完美满足毫秒级 One-Shot 的部署要求。
 ```
+
+
+
+
+
+## 🧠 Core Theoretical Innovations & Technical Implementation
+
+本项目不仅在系统架构上实现了物理层资源分配（Supply）与语义任务感知（Demand）的解耦，更在数学底层完成了一系列极具前瞻性的理论创新。针对 5G/6G 物理层毫秒级低延迟的严苛要求，我们彻底摒弃了传统信息论归因（Attribution）中高昂的数值积分与额外网络训练代价，提出了**基于经验费雪信息加权的解析型语义互信息提取框架**。
+
+### 1. Task-Aware Fisher Information Weighting (解析解替代 U-Net 预测)
+在传统的基于 I-MMSE 定理的信息瓶颈（Information Bottleneck, IB）优化中（如 AAAI 2025 的最新工作），通常需要训练额外的神经网络来预测不同像素的信噪比积分上限 $\gamma_i$。本项目从数学上证明了，该积分上限存在最优解析解，无需额外网络开销。
+
+对交叉熵损失 $\mathcal{L}_{task}$ 进行二阶泰勒展开，并结合 Gauss-Newton 近似，我们将加噪带来的语义失真与模型输入梯度建立联系。在信息瓶颈局部最优条件下，我们求导证明了：**最优 SNR 积分上限 $\gamma_i$ 严格正比于下游任务网络分类梯度的平方（即经验费雪信息矩阵的对角线元素）**：
+$$ \gamma_i^* \propto |\nabla_{x_i} \mathcal{L}_{task}|^2 $$
+这意味着，单次反向传播提取的梯度平方，本身就是各物理网格对任务信息边际收益的精确度量。
+
+### 2. Congruence Transformation for PSD Guarantee (半正定语义协方差构造)
+为了捕获不同时频网格间的语义相关性，并指导下游的矢量水银注水（VMWF）与特征值分解，提取的语义权重矩阵 $\mathbf{C}_{sem}$ 必须严格保证半正定性（Positive Semi-Definite, PSD）。
+
+我们巧妙地引入了**矩阵合同变换（Congruence Transformation）**。令由梯度提取的任务重要性上限向量为 $\mathbf{\gamma}$，构造对角矩阵 $\mathbf{\Gamma} = \text{diag}(\sqrt{\gamma_1}, \dots, \sqrt{\gamma_N})$。结合 Fast Hutchinson 提取的 Diffusion 等效后验协方差矩阵 $\bar{\mathbf{\Sigma}}_{diff}$，全局语义权重矩阵定义为：
+$$ \mathbf{C}_{sem} = \mathbf{\Gamma} \bar{\mathbf{\Sigma}}_{diff} \mathbf{\Gamma} $$
+其非对角元素严格等价于 $C_{sem, ij} = \sqrt{\gamma_i \gamma_j} \cdot \bar{\text{Cov}}_{ij}$。这种构造不仅保留了生成模型提取的空间/语义相关性，更通过几何平均实现了非线性跨维加权，且在数学上绝对保障了矩阵的 PSD 属性，防止注水算法崩溃。
+
+### 3. The "Semantic Sweet Spot" Approximation (积分中值定理与工程极速加速)
+严格的 I-MMSE 互信息提取需要沿 SNR 路径进行连续积分。然而，根据生成扩散模型的物理特性：
+*   当 $t \to T$（极低 SNR）时，系统退化为去相关的各向同性白噪声，非对角项 $\text{Cov}_{ij} \to 0$。
+*   当 $t \to 0$（极高 SNR）时，系统处于高频纹理重构，MMSE 极小且对宏观语义（如 HAR 动作）贡献趋于零。
+
+我们指出，真正的跨网格关联信息高度集中在中间的**“语义过渡甜点区 (Semantic Transition Zone)”**。依据积分中值定理，我们将原本 $O(N \cdot T)$ 复杂度的路径积分，极致压缩为仅在经验选定的少数中间时间步集 $K$ 上的离散均值：
+$$ \bar{\mathbf{\Sigma}}_{diff} \approx \frac{1}{|K|} \sum_{t_k \in K} \text{Cov}_{diff}(t_k) $$
+这一策略在保留全局语义相关性的同时，实现了量级上的效率跃升，完美适配 5G/6G 物理层 One-Shot 帧结构的实时运行约束。
+
+### ⚙️ Overall Workflow Summary
+综合以上理论，本项目的核心感知引擎算法闭环如下：
+1.  **Demand 提取**：前向/反向传播 HAR 分类器，提取梯度平方获得积分上限 $\mathbf{\gamma}$。
+2.  **Supply 提取**：在选定的 Diffusion 甜点区时间步执行 Fast Hutchinson，计算等效平均后验协方差 $\bar{\mathbf{\Sigma}}_{diff}$。
+3.  **Semantic Fusion**：通过合同变换生成严格半正定的语义权重矩阵 $\mathbf{C}_{sem}$。
+4.  **Resource Allocation**：将 $\mathbf{C}_{sem}$ 注入 VMWF 解析层，端到端输出最优功率分配 $\mathbf{P}$ 与奈奎斯特均匀约束下的极稀疏导频 Mask。
+
