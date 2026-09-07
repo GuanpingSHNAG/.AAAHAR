@@ -1,0 +1,183 @@
+import os
+import sys
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from tqdm import tqdm
+
+# 配置项目根目录
+PROJECT_ROOT = "/home/gshang/.AAAHAR"
+sys.path.append(f"{PROJECT_ROOT}/rawdata_train")
+sys.path.append(f"{PROJECT_ROOT}/Diffusion")
+sys.path.append(f"{PROJECT_ROOT}/Csem")
+
+from load.supervised.benchmark_loader import load_benchmark_supervised
+from model.supervised.models import MLPClassifier, ResNet18Classifier
+from semantic_engine_FH import SemanticEngine
+from vmwf_UniPower import VMWF_Allocator
+
+def get_fixed_feedback_mask(B, device):
+    """
+    固定反馈导频掩码。位于前两个时间步。
+    """
+    mask = torch.zeros((B, 1, 32, 32), dtype=torch.float32, device=device)
+    mask[:, 0, 0, 0:32:5] = 1.0
+    mask[:, 0, 1, 3:32:5] = 1.0
+    return mask
+
+def validate(allocator, sparse_mlp, sem_engine, val_loader, total_snr_budget, device):
+    """验证集评估函数"""
+    allocator.eval()
+    sparse_mlp.eval()
+    val_loss = 0.0
+    val_correct = 0
+    total_samples = 0
+    criterion = nn.CrossEntropyLoss()
+
+    with torch.no_grad():
+        for inputs, labels in val_loader:
+            inputs = inputs.to(device).float()
+            labels = labels.to(device)
+            B = inputs.shape[0]
+            
+            snr_budget_batch = torch.full((B, 1), total_snr_budget, device=device)
+            fixed_mask = get_fixed_feedback_mask(B, device)
+            cond_csi = inputs * fixed_mask
+            
+            # 语义特征提取
+            c_sem_batch, diffusion_out = sem_engine(cond_csi, fixed_mask)
+            
+            # 功率分配与传输模拟
+            topk_indices, power_alloc = allocator(c_sem_batch, snr_budget_batch)
+            y_received_sparse, total_mask = allocator.simulate_sensing_link(inputs, topk_indices, power_alloc, fixed_mask)
+            
+            # 分类
+            logits = sparse_mlp(y_received_sparse)
+            loss = criterion(logits, labels)
+            
+            val_loss += loss.item() * B
+            total_samples += B
+            _, predicted = logits.max(1)
+            val_correct += predicted.eq(labels).sum().item()
+            
+    avg_loss = val_loss / total_samples
+    avg_acc = 100. * val_correct / total_samples
+    return avg_loss, avg_acc
+
+def main():
+    # ================= 1. 环境与配置 =================
+    try:
+        local_rank = int(os.environ["LOCAL_RANK"])
+    except:
+        local_rank = 0
+    DEVICE = torch.device(f"cuda:{local_rank}")
+
+
+    DATASET_ROOT = f"{PROJECT_ROOT}/HumanActivityRecognition"
+    TASK_NAME = "HumanActivityRecognition"
+    SAVE_DIR = f"{PROJECT_ROOT}/PowAllocate/checkpoints"
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    
+    BATCH_SIZE = 128
+    EPOCHS = 50
+    NUM_DYNAMIC_PILOTS = 128
+    TOTAL_SNR_BUDGET = 1000.0 
+    
+    print(f"[*] 设备: {DEVICE} | 动态导频数: {NUM_DYNAMIC_PILOTS} | 总功率: {TOTAL_SNR_BUDGET}")
+
+    # ================= 2. 加载数据集 =================
+    print("[*] 正在加载训练与验证数据...")
+    data_info = load_benchmark_supervised(
+        dataset_root=DATASET_ROOT, task_name=TASK_NAME,
+        batch_size=BATCH_SIZE, train_split="train_id", val_split="val_id",
+        test_splits=["test_id"], num_workers=12, use_root_as_task_dir=False
+    )
+    train_loader = data_info['loaders']['train']
+    val_loader = data_info['loaders']['val'] # 提取验证集
+
+    # ================= 3. 初始化网络模型 =================
+    print("[*] 初始化 Semantic Engine (Frozen)...")
+    sem_engine = SemanticEngine(device=DEVICE, num_classes=data_info['num_classes'])
+    sem_engine.eval()
+        
+    print("[*] 初始化 VMWF Power Allocator (Trainable)...")
+    allocator = VMWF_Allocator(N=1024, num_dynamic_pilots=NUM_DYNAMIC_PILOTS).to(DEVICE)
+    
+    print("[*] 初始化 Sparse Task MLP (Trainable)...")
+    sparse_mlp = MLPClassifier(win_len=32, feature_size=32, num_classes=data_info['num_classes']).to(DEVICE)
+    sparse_mlp.load_state_dict(torch.load("/home/gshang/.AAAHAR/Csem/稀疏随机MLP/128.pth", map_location=DEVICE))
+
+    optimizer = optim.AdamW([#{'params': allocator.parameters(), 'lr': 1e-9},
+        {'params': sparse_mlp.parameters(), 'lr': 1e-4}
+    ], weight_decay=1e-4)
+    
+    criterion = nn.CrossEntropyLoss()
+    best_val_acc = 0.0
+
+    # ================= 4. 端到端联合训练大循环 =================
+    print("\n🚀 [START] E2E Joint Training Initiated!")
+    for epoch in range(EPOCHS):
+        # ---------- 训练阶段 ----------
+        allocator.train()
+        sparse_mlp.train()
+        
+        train_loss = 0.0
+        train_correct = 0
+        total_samples = 0
+        
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS} [Train]")
+        for inputs, labels in pbar:
+            inputs = inputs.to(DEVICE).float()
+            labels = labels.to(DEVICE)
+            B = inputs.shape[0]
+            
+            snr_budget_batch = torch.full((B, 1), TOTAL_SNR_BUDGET, device=DEVICE)
+            fixed_mask = get_fixed_feedback_mask(B, DEVICE)
+            cond_csi = inputs * fixed_mask
+            
+            with torch.no_grad():
+                c_sem_batch, diffusion_out = sem_engine(cond_csi, fixed_mask)
+            
+            optimizer.zero_grad()
+            topk_indices, power_alloc = allocator(c_sem_batch, snr_budget_batch)
+            y_received_sparse, total_mask = allocator.simulate_sensing_link(inputs, topk_indices, power_alloc, fixed_mask)
+            
+            logits = sparse_mlp( y_received_sparse)
+            loss = criterion(logits, labels)
+            
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item() * B
+            total_samples += B
+            _, predicted = logits.max(1)
+            train_correct += predicted.eq(labels).sum().item()
+            
+            pbar.set_postfix({'Loss': f"{loss.item():.4f}", 'Acc': f"{100.*train_correct/total_samples:.1f}%"})
+        
+        epoch_train_acc = 100. * train_correct / total_samples
+        epoch_train_loss = train_loss / total_samples
+
+        # ---------- 验证阶段 ----------
+        val_loss, val_acc = validate(allocator, sparse_mlp, sem_engine, val_loader, TOTAL_SNR_BUDGET, DEVICE)
+        
+        print(f"Epoch {epoch+1:02d}/{EPOCHS} | "
+              f"Train Acc: {epoch_train_acc:.2f}% Loss: {epoch_train_loss:.4f} | "
+              f"Val Acc: {val_acc:.2f}% Loss: {val_loss:.4f}")
+        
+        # ---------- 保存最优模型 ----------
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            save_path = os.path.join(SAVE_DIR, f"best_model_pilots={NUM_DYNAMIC_PILOTS}.pth")
+            torch.save({
+                'epoch': epoch + 1,
+                'allocator_state_dict': allocator.state_dict(),
+                'sparse_mlp_state_dict': sparse_mlp.state_dict(),
+                'val_acc': val_acc,
+            }, save_path)
+            print(f"[*] 检测到更好的验证集准确率，模型已保存至: {save_path}")
+
+    print(f"\n[DONE] 训练完成！最佳验证集准确率: {best_val_acc:.2f}%")
+
+if __name__ == "__main__":
+    main()
